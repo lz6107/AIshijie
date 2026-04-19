@@ -293,7 +293,7 @@ SYSTEM_PROMPT = """
 5. 不要加入原文没有的信息
 6. 不要输出英文
 7. 输出必须严格按照指定模板
-8. “市场倾向”必须和内容写在同一行，不能换行单独写
+8. 【市场倾向】必须和结果写在同一行，不能换行单独写
 """.strip()
 
 
@@ -309,7 +309,11 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 【势界行情深读】
 写2到3句，分析市场如何理解这条消息，语气稳健，偏交易视角
 
-市场倾向：只能输出 偏多 / 偏空 / 中性 / 观望 其中一个，并且必须和“市场倾向：”写在同一行
+【市场倾向】 偏多 / 偏空 / 中性 / 观望
+注意：
+1. 必须只输出其中一个结果
+2. 必须和【市场倾向】写在同一行
+3. 不能拆成两行
 
 额外要求：
 1. 不要输出英文标题
@@ -317,8 +321,7 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 3. 不要输出来源
 4. 不要输出链接
 5. 不要添加多余栏目
-6. 不要把“市场倾向”拆成两行
-7. 最终只输出中文成品
+6. 最终只输出中文成品
 
 英文标题：
 {title_en}
@@ -342,7 +345,7 @@ def ai_compile_news(title_en: str, summary_en: str) -> str:
 def is_valid_ai_output(text: str) -> bool:
     if not text:
         return False
-    required = ["【新闻】", "【势界行情深读】", "市场倾向："]
+    required = ["【新闻】", "【势界行情深读】", "【市场倾向】"]
     return all(x in text for x in required)
 
 
