@@ -3,7 +3,9 @@ import re
 import time
 import html
 import sqlite3
+import random
 from datetime import datetime
+from urllib.parse import urlparse, urljoin
 
 import feedparser
 import requests
@@ -30,8 +32,13 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
 MODEL_NAME = "gpt-5.4-nano"
 FIRST_RUN_SKIP_OLD = True
-MAX_SUMMARY_LENGTH = 1800
+MAX_SUMMARY_LENGTH = 450
 SEND_DELAY = 2
+COVERS_DIR = "covers"
+
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+}
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -83,15 +90,15 @@ def has_any_sent_items() -> bool:
 
 
 # =========================
-# 文本清洗
+# 文本处理
 # =========================
 
 def clean_html(text: str) -> str:
     if not text:
         return ""
     text = html.unescape(text)
-    text = re.sub(r"<br\\s*/?>", "\n", text, flags=re.I)
-    text = re.sub(r"</p\\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.I)
     text = re.sub(r"<.*?>", "", text, flags=re.S)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
@@ -130,31 +137,162 @@ def extract_summary(entry) -> str:
 
 
 # =========================
-# AI 编译
+# 图片处理
+# =========================
+
+def is_valid_http_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
+def normalize_image_url(img_url: str, base_url: str) -> str:
+    if not img_url:
+        return ""
+    if img_url.startswith("//"):
+        return "https:" + img_url
+    if img_url.startswith("/"):
+        return urljoin(base_url, img_url)
+    return img_url
+
+
+def get_image_url_from_rss(entry) -> str:
+    media_content = getattr(entry, "media_content", None)
+    if media_content and isinstance(media_content, list):
+        for item in media_content:
+            url = item.get("url")
+            if url:
+                return url
+
+    media_thumbnail = getattr(entry, "media_thumbnail", None)
+    if media_thumbnail and isinstance(media_thumbnail, list):
+        for item in media_thumbnail:
+            url = item.get("url")
+            if url:
+                return url
+
+    links = getattr(entry, "links", [])
+    if links:
+        for item in links:
+            href = item.get("href", "")
+            type_ = item.get("type", "")
+            rel = item.get("rel", "")
+            if href and (rel == "enclosure" or str(type_).startswith("image/")):
+                return href
+
+    raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+    if raw_summary:
+        m = re.search(r'<img[^>]+src="([^"]+)"', raw_summary, re.I)
+        if m:
+            return m.group(1)
+
+    return ""
+
+
+def get_image_url_from_page(article_url: str) -> str:
+    if not is_valid_http_url(article_url):
+        return ""
+
+    try:
+        resp = requests.get(article_url, headers=REQUEST_HEADERS, timeout=15)
+        if resp.status_code != 200 or not resp.text:
+            return ""
+
+        html_text = resp.text
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+        ]
+
+        for pattern in patterns:
+            m = re.search(pattern, html_text, re.I)
+            if m:
+                img = normalize_image_url(m.group(1).strip(), article_url)
+                if is_valid_http_url(img):
+                    return img
+
+        imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, re.I)
+        for img in imgs:
+            img = normalize_image_url(img.strip(), article_url)
+            if not is_valid_http_url(img):
+                continue
+
+            lower_img = img.lower()
+            if any(x in lower_img for x in ["logo", "icon", "avatar", "sprite", ".svg"]):
+                continue
+
+            return img
+
+    except Exception as e:
+        print(f"网页抓图失败: {article_url} -> {e}")
+
+    return ""
+
+
+def get_local_cover_list():
+    if not os.path.isdir(COVERS_DIR):
+        return []
+
+    files = []
+    for name in os.listdir(COVERS_DIR):
+        lower = name.lower()
+        if lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".png"):
+            files.append(os.path.join(COVERS_DIR, name))
+
+    return sorted(files)
+
+
+def get_random_local_cover():
+    covers = get_local_cover_list()
+    if not covers:
+        return ""
+    return random.choice(covers)
+
+
+def get_best_image(entry, article_url: str):
+    """
+    返回:
+    ("url", 图片URL)
+    ("file", 本地图片路径)
+    ("", "")
+    """
+    rss_img = get_image_url_from_rss(entry)
+    if is_valid_http_url(rss_img):
+        return ("url", rss_img)
+
+    page_img = get_image_url_from_page(article_url)
+    if is_valid_http_url(page_img):
+        return ("url", page_img)
+
+    local_cover = get_random_local_cover()
+    if local_cover and os.path.isfile(local_cover):
+        return ("file", local_cover)
+
+    return ("", "")
+
+
+# =========================
+# AI 提示词
 # =========================
 
 SYSTEM_PROMPT = """
-你是“势界行情深读”的中文财经编辑，擅长把英文财经、加密市场、宏观新闻整理成适合中文频道发布的市场解读内容。
+你是“势界行情深读”的中文财经编辑。你的任务不是机械翻译，而是做中文编译 + 市场解读。
 
-你的任务不是机械翻译，而是做“中文编译 + 市场解读”。
-
-你输出内容时，必须使用“势界观点”的口吻，风格要求如下：
-
-1. 语言自然、清晰，像中文财经编辑写的，不要逐句直译
-2. 不要空话、套话、废话，不要机械复述新闻
-3. 不要喊单，不要夸张，不要使用“必涨”“必跌”“马上起飞”之类表达
-4. 重点分析这条消息对市场意味着什么，而不是只说新闻发生了什么
-5. 优先从以下角度中选择2到4个展开：
-   - 市场情绪
-   - 资金预期
-   - 短线影响
-   - 后续持续性
-   - 风险提示
-6. 风格偏交易视角，但表达要稳健
-7. 不能编造原文没有的信息
-8. 不要输出英文
-9. 输出必须适合 Telegram 频道阅读，结构清楚，长度适中
-10. 最终必须严格按照指定模板输出
+要求：
+1. 语言自然、简洁，不要逐句直译
+2. 不要空话，不要喊单，不要夸张
+3. 重点分析市场如何理解这条消息
+4. 只从情绪、资金预期、短线影响、后续观察中选2到3个角度展开
+5. 不要加入原文没有的信息
+6. 不要输出英文
+7. 必须严格按照模板输出
 """.strip()
 
 
@@ -162,44 +300,18 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
     return f"""
 请根据下面这条英文财经新闻，生成适合“势界行情深读”频道发布的中文内容。
 
-请严格按以下格式输出：
+严格按这个格式输出：
 
 【势界行情深读】
 
 新闻：
-用一句中文概括这条新闻，不要逐字直译，要像中文财经媒体的一句话新闻导语。
+用一句中文概括这条新闻
 
 势界观点：
-写3到4句分析，解释这条消息对市场意味着什么。
-重点不是复述新闻，而是分析市场会如何理解这条消息。
-优先从以下角度中选择2到4个展开：
-- 市场情绪
-- 资金预期
-- 短线影响
-- 后续持续性
-- 风险提示
-
-要求：
-1. 不要逐句翻译原文
-2. 不要只是复述新闻
-3. 要像频道编辑在做市场拆解
-4. 语气稳健，有交易视角，但不要喊单
-5. 不要加入原文没有的信息
-6. 每句尽量有信息量，不要空泛
+写2到3句，分析市场如何理解这条消息，语气稳健，偏交易视角
 
 市场倾向：
-只能从以下四个中选一个：
-偏多 / 偏空 / 中性 / 观望
-
-补充要求：
-- “新闻”部分只能写1句
-- “势界观点”部分写3到4句
-- “市场倾向”只能输出一个词，不要解释
-- 不要使用项目符号
-- 不要输出多余说明
-- 直接输出最终成品
-- 不要出现“根据新闻来看”“综合来看”这类空泛开头
-- “势界观点”要尽量像有市场经验的人在拆解消息
+只能输出 偏多 / 偏空 / 中性 / 观望 其中一个
 
 英文标题：
 {title_en}
@@ -217,9 +329,7 @@ def ai_compile_news(title_en: str, summary_en: str) -> str:
         instructions=SYSTEM_PROMPT,
         input=prompt,
     )
-
-    text = (response.output_text or "").strip()
-    return text
+    return (response.output_text or "").strip()
 
 
 def is_valid_ai_output(text: str) -> bool:
@@ -245,6 +355,39 @@ def send_telegram_message(text: str):
         timeout=30
     )
     print("sendMessage 结果:", resp.status_code, resp.text)
+    return resp
+
+
+def send_telegram_photo_by_url(photo_url: str, caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    resp = requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "photo": photo_url,
+            "caption": caption
+        },
+        timeout=30
+    )
+    print("sendPhoto(url) 结果:", resp.status_code, resp.text)
+    return resp
+
+
+def send_telegram_photo_by_file(photo_path: str, caption: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    with open(photo_path, "rb") as f:
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "caption": caption
+            },
+            files={
+                "photo": f
+            },
+            timeout=30
+        )
+    print("sendPhoto(file) 结果:", resp.status_code, resp.text)
     return resp
 
 
@@ -290,7 +433,23 @@ def process_feed(feed_url: str):
                 mark_sent(link)
                 continue
 
-            resp = send_telegram_message(final_text)
+            img_type, img_value = get_best_image(entry, link)
+
+            if img_type == "url":
+                resp = send_telegram_photo_by_url(img_value, final_text)
+                if resp.status_code != 200:
+                    print("远程图片发送失败，改为纯文字")
+                    resp = send_telegram_message(final_text)
+
+            elif img_type == "file":
+                resp = send_telegram_photo_by_file(img_value, final_text)
+                if resp.status_code != 200:
+                    print("本地公图发送失败，改为纯文字")
+                    resp = send_telegram_message(final_text)
+
+            else:
+                resp = send_telegram_message(final_text)
+
             if resp.status_code == 200:
                 mark_sent(link)
                 print("已发送:", title_en)
@@ -323,7 +482,7 @@ def main():
             except Exception as e:
                 print(f"处理 RSS 失败 {rss}: {e}")
 
-        print(f"休眠 {CHECK_INTERVAL} 秒...\\n")
+        print(f"休眠 {CHECK_INTERVAL} 秒...\n")
         time.sleep(CHECK_INTERVAL)
 
 
