@@ -28,7 +28,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
-MODEL_NAME = "gpt-5.2"
+MODEL_NAME = "gpt-5.4-mini"
 FIRST_RUN_SKIP_OLD = True
 MAX_SUMMARY_LENGTH = 1800
 SEND_DELAY = 2
