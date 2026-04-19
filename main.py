@@ -4,6 +4,7 @@ import time
 import html
 import sqlite3
 import random
+import tempfile
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
@@ -37,7 +38,9 @@ SEND_DELAY = 2
 COVERS_DIR = "covers"
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Referer": "https://www.google.com/",
 }
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -256,26 +259,68 @@ def get_random_local_cover():
     return random.choice(covers)
 
 
-def get_best_image(entry, article_url: str):
-    """
-    返回:
-    ("url", 图片URL)
-    ("file", 本地图片路径)
-    ("", "")
-    """
+def get_best_remote_image_url(entry, article_url: str) -> str:
     rss_img = get_image_url_from_rss(entry)
     if is_valid_http_url(rss_img):
-        return ("url", rss_img)
+        return rss_img
 
     page_img = get_image_url_from_page(article_url)
     if is_valid_http_url(page_img):
-        return ("url", page_img)
+        return page_img
 
-    local_cover = get_random_local_cover()
-    if local_cover and os.path.isfile(local_cover):
-        return ("file", local_cover)
+    return ""
 
-    return ("", "")
+
+def guess_extension_from_response(resp, url: str) -> str:
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+
+    if "jpeg" in content_type or "jpg" in content_type:
+        return ".jpg"
+    if "png" in content_type:
+        return ".png"
+    if "webp" in content_type:
+        return ".webp"
+
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if path.endswith(".jpg") or path.endswith(".jpeg"):
+        return ".jpg"
+    if path.endswith(".png"):
+        return ".png"
+    if path.endswith(".webp"):
+        return ".webp"
+
+    return ".jpg"
+
+
+def download_remote_image(url: str) -> str:
+    """
+    下载远程图片到临时文件，返回本地路径；失败返回空字符串。
+    """
+    if not is_valid_http_url(url):
+        return ""
+
+    try:
+        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=20, stream=True)
+        if resp.status_code != 200:
+            print(f"下载图片失败，状态码: {resp.status_code} -> {url}")
+            return ""
+
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if not any(x in content_type for x in ["image/", "jpeg", "jpg", "png", "webp"]):
+            print(f"下载内容不是图片: {content_type} -> {url}")
+            return ""
+
+        ext = guess_extension_from_response(resp, url)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    tmp.write(chunk)
+            return tmp.name
+
+    except Exception as e:
+        print(f"下载远程图片异常: {url} -> {e}")
+        return ""
 
 
 # =========================
@@ -368,21 +413,6 @@ def send_telegram_message(text: str):
     return resp
 
 
-def send_telegram_photo_by_url(photo_url: str, caption: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": CHAT_ID,
-            "photo": photo_url,
-            "caption": caption
-        },
-        timeout=30
-    )
-    print("sendPhoto(url) 结果:", resp.status_code, resp.text)
-    return resp
-
-
 def send_telegram_photo_by_file(photo_path: str, caption: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     with open(photo_path, "rb") as f:
@@ -435,6 +465,7 @@ def process_feed(feed_url: str):
 
         summary_en = extract_summary(entry)
 
+        temp_remote_file = ""
         try:
             final_text = ai_compile_news(title_en, summary_en)
 
@@ -443,22 +474,28 @@ def process_feed(feed_url: str):
                 mark_sent(link)
                 continue
 
-            img_type, img_value = get_best_image(entry, link)
+            # 先尝试远程图：下载到本地后再上传
+            remote_img_url = get_best_remote_image_url(entry, link)
+            if remote_img_url:
+                temp_remote_file = download_remote_image(remote_img_url)
 
-            if img_type == "url":
-                resp = send_telegram_photo_by_url(img_value, final_text)
+            resp = None
+
+            if temp_remote_file and os.path.isfile(temp_remote_file):
+                resp = send_telegram_photo_by_file(temp_remote_file, final_text)
                 if resp.status_code != 200:
-                    print("远程图片发送失败，改为纯文字")
-                    resp = send_telegram_message(final_text)
+                    print("远程图下载后上传失败，尝试公图")
 
-            elif img_type == "file":
-                resp = send_telegram_photo_by_file(img_value, final_text)
-                if resp.status_code != 200:
-                    print("本地公图发送失败，改为纯文字")
+            # 远程图失败，尝试公图
+            if resp is None or resp.status_code != 200:
+                local_cover = get_random_local_cover()
+                if local_cover and os.path.isfile(local_cover):
+                    resp = send_telegram_photo_by_file(local_cover, final_text)
+                    if resp.status_code != 200:
+                        print("公图发送失败，改为纯文字")
+                        resp = send_telegram_message(final_text)
+                else:
                     resp = send_telegram_message(final_text)
-
-            else:
-                resp = send_telegram_message(final_text)
 
             if resp.status_code == 200:
                 mark_sent(link)
@@ -468,6 +505,13 @@ def process_feed(feed_url: str):
 
         except Exception as e:
             print("处理失败:", title_en, "->", e)
+
+        finally:
+            if temp_remote_file and os.path.isfile(temp_remote_file):
+                try:
+                    os.remove(temp_remote_file)
+                except Exception:
+                    pass
 
         time.sleep(SEND_DELAY)
 
