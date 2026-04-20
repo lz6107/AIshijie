@@ -33,9 +33,10 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
 MODEL_NAME = "gpt-5.4-nano"
 FIRST_RUN_SKIP_OLD = True
-MAX_SUMMARY_LENGTH = 450
+MAX_SUMMARY_LENGTH = 420
 SEND_DELAY = 2
 COVERS_DIR = "covers"
+MAX_FEED_ITEMS_PER_CHECK = 10
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -294,9 +295,6 @@ def guess_extension_from_response(resp, url: str) -> str:
 
 
 def download_remote_image(url: str) -> str:
-    """
-    下载远程图片到临时文件，返回本地路径；失败返回空字符串。
-    """
     if not is_valid_http_url(url):
         return ""
 
@@ -307,7 +305,7 @@ def download_remote_image(url: str) -> str:
             return ""
 
         content_type = (resp.headers.get("Content-Type") or "").lower()
-        if not any(x in content_type for x in ["image/", "jpeg", "jpg", "png", "webp"]):
+        if "image/" not in content_type and not any(x in content_type for x in ["jpeg", "jpg", "png", "webp"]):
             print(f"下载内容不是图片: {content_type} -> {url}")
             return ""
 
@@ -339,6 +337,16 @@ SYSTEM_PROMPT = """
 6. 不要输出英文
 7. 输出必须严格按照指定模板
 8. 【市场倾向】必须和结果写在同一行，不能换行单独写
+9. 避免反复使用同一种句式开头，不要总是用“市场会把……视为……”“交易上可关注……”这类固定表达
+10. 尽量轮换表达方式，例如：
+   - 这条消息本质上反映的是……
+   - 真正值得关注的不是……而是……
+   - 对市场来说，更重要的是……
+   - 短线影响主要落在……
+   - 这类变化更多影响的是……
+   - 从资金反应看……
+   - 表面上是……，但核心在于……
+   - 这件事释放的信号是……
 """.strip()
 
 
@@ -353,6 +361,7 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 
 【势界行情深读】
 写2到3句，分析市场如何理解这条消息，语气稳健，偏交易视角
+不要总是用同一种句式开头，尽量避免模板化表达。
 
 【市场倾向】 偏多 / 偏空 / 中性 / 观望
 注意：
@@ -422,9 +431,7 @@ def send_telegram_photo_by_file(photo_path: str, caption: str):
                 "chat_id": CHAT_ID,
                 "caption": caption
             },
-            files={
-                "photo": f
-            },
+            files={"photo": f},
             timeout=30
         )
     print("sendPhoto(file) 结果:", resp.status_code, resp.text)
@@ -443,7 +450,7 @@ def process_feed(feed_url: str):
         print("没有抓到内容")
         return
 
-    entries = list(feed.entries[:10])
+    entries = list(feed.entries[:MAX_FEED_ITEMS_PER_CHECK])
     entries.reverse()
 
     first_run = not has_any_sent_items()
@@ -458,14 +465,15 @@ def process_feed(feed_url: str):
         if has_sent(link):
             continue
 
+        # 首次启动：把当前旧内容全部记入数据库，但不发送
         if first_run and FIRST_RUN_SKIP_OLD:
             print("首次运行，跳过旧新闻:", title_en)
             mark_sent(link)
             continue
 
         summary_en = extract_summary(entry)
-
         temp_remote_file = ""
+
         try:
             final_text = ai_compile_news(title_en, summary_en)
 
@@ -474,19 +482,19 @@ def process_feed(feed_url: str):
                 mark_sent(link)
                 continue
 
-            # 先尝试远程图：下载到本地后再上传
+            resp = None
+
+            # 1) 尝试远程图：先下载再上传
             remote_img_url = get_best_remote_image_url(entry, link)
             if remote_img_url:
                 temp_remote_file = download_remote_image(remote_img_url)
 
-            resp = None
-
             if temp_remote_file and os.path.isfile(temp_remote_file):
                 resp = send_telegram_photo_by_file(temp_remote_file, final_text)
                 if resp.status_code != 200:
-                    print("远程图下载后上传失败，尝试公图")
+                    print("远程图上传失败，尝试公图")
 
-            # 远程图失败，尝试公图
+            # 2) 远程图失败，尝试公图
             if resp is None or resp.status_code != 200:
                 local_cover = get_random_local_cover()
                 if local_cover and os.path.isfile(local_cover):
