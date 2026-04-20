@@ -115,7 +115,20 @@ def shorten_text(text: str, max_len: int) -> str:
     text = text.strip()
     if len(text) <= max_len:
         return text
-    return text[:max_len].rstrip() + "..."
+
+    cut = text[:max_len].rstrip()
+
+    split_chars = ["。", "！", "？", "；", "，", ".", "!", "?", ";", ","]
+    last_pos = -1
+    for ch in split_chars:
+        pos = cut.rfind(ch)
+        if pos > last_pos:
+            last_pos = pos
+
+    if last_pos >= max_len // 2:
+        cut = cut[:last_pos + 1].rstrip()
+
+    return cut
 
 
 def extract_summary(entry) -> str:
@@ -328,25 +341,35 @@ def download_remote_image(url: str) -> str:
 SYSTEM_PROMPT = """
 你是“势界行情深读”的中文财经编辑。你的任务不是机械翻译，而是做中文编译 + 市场解读。
 
-要求：
-1. 语言自然、简洁，不要逐句直译
+写作要求：
+1. 语言自然、简洁、有判断力，不要逐句直译
 2. 不要空话，不要喊单，不要夸张
-3. 重点分析市场如何理解这条消息
-4. 只从情绪、资金预期、短线影响、后续观察中选2到3个角度展开
+3. 重点分析市场如何理解这条消息，而不是重复新闻本身
+4. 每条内容只从2到3个角度展开，角度可包括：情绪、资金预期、短线影响、后续观察、风险、供需、交易逻辑
 5. 不要加入原文没有的信息
 6. 不要输出英文
 7. 输出必须严格按照指定模板
 8. 【市场倾向】必须和结果写在同一行，不能换行单独写
-9. 避免反复使用同一种句式开头，不要总是用“市场会把……视为……”“交易上可关注……”这类固定表达
-10. 尽量轮换表达方式，例如：
-   - 这条消息本质上反映的是……
-   - 真正值得关注的不是……而是……
+9. 不要反复使用这些句式：
+   - 这条消息的核心在于……
+   - 真正需要观察的是……
+   - 市场会把……视为……
+   - 短线更容易……
+   - 本质上会先被交易层面当作……
+10. 每次尽量更换开头表达方式
+11. 可以灵活使用但不要反复重复：
+   - 先看结果，这条消息……
    - 对市场来说，更重要的是……
-   - 短线影响主要落在……
-   - 这类变化更多影响的是……
-   - 从资金反应看……
-   - 表面上是……，但核心在于……
-   - 这件事释放的信号是……
+   - 真正有影响的不是……而是……
+   - 从交易层面看……
+   - 这类变化通常先影响……
+   - 表面看是……，但盘面更在意……
+   - 这件事释放出的信号是……
+   - 如果市场继续沿着这个逻辑交易……
+12. 不要写成公文腔，也不要每句都像结论句
+13. 不要使用“...”或“……”或任何省略式表达
+14. 句子必须完整，宁可更短也不要半句话
+15. 【势界行情深读】部分总字数尽量控制在70到110字之间
 """.strip()
 
 
@@ -360,8 +383,8 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 用一句中文概括这条新闻
 
 【势界行情深读】
-写2到3句，分析市场如何理解这条消息，语气稳健，偏交易视角
-不要总是用同一种句式开头，尽量避免模板化表达。
+写2到3句，分析市场如何理解这条消息，语气稳健，偏交易视角，但不要写成固定模板。
+每次尽量换一种表达方式，不要总是同一种句式起笔。
 
 【市场倾向】 偏多 / 偏空 / 中性 / 观望
 注意：
@@ -376,6 +399,9 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 4. 不要输出链接
 5. 不要添加多余栏目
 6. 最终只输出中文成品
+7. 【势界行情深读】部分避免模板化、套话化、公文腔
+8. 不要使用“……”或“...”结尾
+9. 句子必须完整，不要半句话
 
 英文标题：
 {title_en}
@@ -465,7 +491,6 @@ def process_feed(feed_url: str):
         if has_sent(link):
             continue
 
-        # 首次启动：把当前旧内容全部记入数据库，但不发送
         if first_run and FIRST_RUN_SKIP_OLD:
             print("首次运行，跳过旧新闻:", title_en)
             mark_sent(link)
@@ -484,7 +509,6 @@ def process_feed(feed_url: str):
 
             resp = None
 
-            # 1) 尝试远程图：先下载再上传
             remote_img_url = get_best_remote_image_url(entry, link)
             if remote_img_url:
                 temp_remote_file = download_remote_image(remote_img_url)
@@ -494,7 +518,6 @@ def process_feed(feed_url: str):
                 if resp.status_code != 200:
                     print("远程图上传失败，尝试公图")
 
-            # 2) 远程图失败，尝试公图
             if resp is None or resp.status_code != 200:
                 local_cover = get_random_local_cover()
                 if local_cover and os.path.isfile(local_cover):
