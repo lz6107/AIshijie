@@ -117,17 +117,14 @@ def shorten_text(text: str, max_len: int) -> str:
         return text
 
     cut = text[:max_len].rstrip()
-
     split_chars = ["。", "！", "？", "；", "，", ".", "!", "?", ";", ","]
     last_pos = -1
     for ch in split_chars:
         pos = cut.rfind(ch)
         if pos > last_pos:
             last_pos = pos
-
     if last_pos >= max_len // 2:
         cut = cut[:last_pos + 1].rstrip()
-
     return cut
 
 
@@ -151,6 +148,28 @@ def extract_summary(entry) -> str:
         return ""
 
     return shorten_text(summary_clean, MAX_SUMMARY_LENGTH)
+
+
+def clean_line(text: str) -> str:
+    if not text:
+        return ""
+    text = clean_html(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n+", " ", text)
+    text = text.replace("...", "").replace("……", "")
+    return text.strip(" \n\r\t-—:：")
+
+
+def clean_paragraph(text: str) -> str:
+    if not text:
+        return ""
+    text = clean_html(text)
+    text = text.replace("...", "").replace("……", "")
+    text = re.sub(r"\n{2,}", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    lines = [x.strip(" \t") for x in text.split("\n") if x.strip()]
+    text = "\n".join(lines).strip()
+    return text
 
 
 # =========================
@@ -240,11 +259,9 @@ def get_image_url_from_page(article_url: str) -> str:
             img = normalize_image_url(img.strip(), article_url)
             if not is_valid_http_url(img):
                 continue
-
             lower_img = img.lower()
             if any(x in lower_img for x in ["logo", "icon", "avatar", "sprite", ".svg"]):
                 continue
-
             return img
 
     except Exception as e:
@@ -262,7 +279,6 @@ def get_local_cover_list():
         lower = name.lower()
         if lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".png"):
             files.append(os.path.join(COVERS_DIR, name))
-
     return sorted(files)
 
 
@@ -348,60 +364,38 @@ SYSTEM_PROMPT = """
 4. 每条内容只从2到3个角度展开，角度可包括：情绪、资金预期、短线影响、后续观察、风险、供需、交易逻辑
 5. 不要加入原文没有的信息
 6. 不要输出英文
-7. 输出必须严格按照指定模板
-8. 【市场倾向】必须和结果写在同一行，不能换行单独写
-9. 不要反复使用这些句式：
+7. 不要反复使用这些句式：
    - 这条消息的核心在于……
    - 真正需要观察的是……
    - 市场会把……视为……
    - 短线更容易……
    - 本质上会先被交易层面当作……
-10. 每次尽量更换开头表达方式
-11. 可以灵活使用但不要反复重复：
-   - 先看结果，这条消息……
-   - 对市场来说，更重要的是……
-   - 真正有影响的不是……而是……
-   - 从交易层面看……
-   - 这类变化通常先影响……
-   - 表面看是……，但盘面更在意……
-   - 这件事释放出的信号是……
-   - 如果市场继续沿着这个逻辑交易……
-12. 不要写成公文腔，也不要每句都像结论句
-13. 不要使用“...”或“……”或任何省略式表达
-14. 句子必须完整，宁可更短也不要半句话
-15. 【势界行情深读】部分总字数尽量控制在70到110字之间
+8. 每次尽量更换开头表达方式
+9. 不要使用“...”或“……”或任何省略式表达
+10. 句子必须完整，宁可更短也不要半句话
+11. 【势界行情深读】部分总字数尽量控制在70到110字
 """.strip()
 
 
 def build_user_prompt(title_en: str, summary_en: str) -> str:
     return f"""
-请根据下面这条英文财经新闻，生成适合“势界行情深读”频道发布的中文内容。
+请根据下面这条英文财经新闻，输出一个 JSON 对象，不要输出 JSON 以外的任何内容。
 
-严格按这个格式输出：
+JSON 格式必须严格如下：
+{{
+  "news": "一句中文新闻",
+  "insight": "2到3句中文分析",
+  "bias": "偏多/偏空/中性/观望"
+}}
 
-【新闻】
-用一句中文概括这条新闻
-
-【势界行情深读】
-写2到3句，分析市场如何理解这条消息，语气稳健，偏交易视角，但不要写成固定模板。
-每次尽量换一种表达方式，不要总是同一种句式起笔。
-
-【市场倾向】 偏多 / 偏空 / 中性 / 观望
-注意：
-1. 必须只输出其中一个结果
-2. 必须和【市场倾向】写在同一行
-3. 不能拆成两行
-
-额外要求：
-1. 不要输出英文标题
-2. 不要输出英文摘要
-3. 不要输出来源
-4. 不要输出链接
-5. 不要添加多余栏目
-6. 最终只输出中文成品
-7. 【势界行情深读】部分避免模板化、套话化、公文腔
-8. 不要使用“……”或“...”结尾
-9. 句子必须完整，不要半句话
+要求：
+1. news 只写一句，简洁完整
+2. insight 写2到3句，避免模板化表达，不要总是同一种起手句
+3. bias 只能是：偏多、偏空、中性、观望 四选一
+4. 不要输出英文
+5. 不要输出来源、链接、标题说明、额外字段
+6. 不要出现省略号
+7. 句子必须完整
 
 英文标题：
 {title_en}
@@ -409,6 +403,50 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 英文摘要：
 {summary_en if summary_en else "（无摘要）"}
 """.strip()
+
+
+def extract_json_object(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"\{.*\}", text, re.S)
+    return m.group(0).strip() if m else ""
+
+
+def normalize_ai_result(raw_text: str) -> str:
+    """
+    强制重组为固定格式：
+    【新闻】
+    ...
+    
+    【势界行情深读】
+    ...
+    
+    【市场倾向】 偏多
+    """
+    import json
+
+    raw_json = extract_json_object(raw_text)
+    if not raw_json:
+        return ""
+
+    try:
+        data = json.loads(raw_json)
+    except Exception:
+        return ""
+
+    news = clean_line(str(data.get("news", "")))
+    insight = clean_paragraph(str(data.get("insight", "")))
+    bias = clean_line(str(data.get("bias", "")))
+
+    allowed = {"偏多", "偏空", "中性", "观望"}
+    if bias not in allowed:
+        return ""
+
+    if not news or not insight:
+        return ""
+
+    final_text = f"【新闻】\n{news}\n\n【势界行情深读】\n{insight}\n\n【市场倾向】 {bias}"
+    return final_text.strip()
 
 
 def ai_compile_news(title_en: str, summary_en: str) -> str:
@@ -419,13 +457,14 @@ def ai_compile_news(title_en: str, summary_en: str) -> str:
         instructions=SYSTEM_PROMPT,
         input=prompt,
     )
-    return (response.output_text or "").strip()
+    raw_text = (response.output_text or "").strip()
+    return normalize_ai_result(raw_text)
 
 
 def is_valid_ai_output(text: str) -> bool:
     if not text:
         return False
-    required = ["【新闻】", "【势界行情深读】", "【市场倾向】"]
+    required = ["【新闻】\n", "\n【势界行情深读】\n", "\n【市场倾向】 "]
     return all(x in text for x in required)
 
 
