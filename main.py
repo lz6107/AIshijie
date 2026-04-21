@@ -1,9 +1,9 @@
 import os
 import re
+import json
 import time
 import html
 import sqlite3
-import random
 import tempfile
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
@@ -18,33 +18,53 @@ from openai import OpenAI
 # =========================
 
 RSS_URLS = [
+    # 美股 / 宏观
     "https://feeds.bloomberg.com/markets/news.rss",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss",
-    "https://decrypt.co/feed",
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "https://feeds.reuters.com/Reuters/worldNews",
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://feeds.reuters.com/news/usmarkets",
+    # 加一点港股/中国市场联动信号
+    "https://www.scmp.com/rss/91/feed",
+    "https://finance.yahoo.com/news/rssindex",
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
+MAX_SUMMARY_LENGTH = int(os.getenv("MAX_SUMMARY_LENGTH", "500"))
+MAX_FEED_ITEMS_PER_CHECK = int(os.getenv("MAX_FEED_ITEMS_PER_CHECK", "8"))
 
 MODEL_NAME = "gpt-5.4-nano"
 FIRST_RUN_SKIP_OLD = True
-MAX_SUMMARY_LENGTH = 420
-SEND_DELAY = 2
-COVERS_DIR = "covers"
-MAX_FEED_ITEMS_PER_CHECK = 10
+IMAGES_DIR = "images"
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Referer": "https://www.google.com/",
 }
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# =========================
+# RSS 过滤关键词
+# =========================
+
+SKIP_KEYWORDS = [
+    "podcast",
+    "newsletter",
+    "video",
+    "watch live",
+    "live blog",
+    "live updates",
+    "minute-by-minute",
+    "opinion",
+    "editorial",
+]
 
 
 # =========================
@@ -150,13 +170,19 @@ def extract_summary(entry) -> str:
     return shorten_text(summary_clean, MAX_SUMMARY_LENGTH)
 
 
-def clean_line(text: str) -> str:
+def should_skip_title(title_en: str) -> bool:
+    title_lower = (title_en or "").lower().strip()
+    if not title_lower:
+        return True
+    return any(k in title_lower for k in SKIP_KEYWORDS)
+
+
+def clean_one_line(text: str) -> str:
     if not text:
         return ""
     text = clean_html(text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n+", " ", text)
     text = text.replace("...", "").replace("……", "")
+    text = re.sub(r"\s+", " ", text)
     return text.strip(" \n\r\t-—:：")
 
 
@@ -165,189 +191,94 @@ def clean_paragraph(text: str) -> str:
         return ""
     text = clean_html(text)
     text = text.replace("...", "").replace("……", "")
-    text = re.sub(r"\n{2,}", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
-    lines = [x.strip(" \t") for x in text.split("\n") if x.strip()]
-    text = "\n".join(lines).strip()
-    return text
+    text = re.sub(r"\n{2,}", "\n", text)
+    lines = [x.strip() for x in text.split("\n") if x.strip()]
+    return "\n".join(lines).strip()
 
 
 # =========================
 # 图片处理
 # =========================
 
-def is_valid_http_url(url: str) -> bool:
-    if not url:
-        return False
-    try:
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
+def image_path(filename: str) -> str:
+    return os.path.join(IMAGES_DIR, filename)
 
 
-def normalize_image_url(img_url: str, base_url: str) -> str:
-    if not img_url:
-        return ""
-    if img_url.startswith("//"):
-        return "https:" + img_url
-    if img_url.startswith("/"):
-        return urljoin(base_url, img_url)
-    return img_url
+IMAGE_MAP = {
+    ("market", "偏多"): "01_market_bull.png",
+    ("market", "偏空"): "02_market_bear.png",
+    ("market", "中性"): "03_market_neutral.png",
+    ("market", "观望"): "04_market_watch.png",
+
+    ("macro", "偏多"): "05_macro_bull.png",
+    ("macro", "偏空"): "06_macro_bear.png",
+    ("macro", "中性"): "07_macro_neutral.png",
+    ("macro", "观望"): "08_macro_watch.png",
+
+    ("earnings", "偏多"): "09_earnings_bull.png",
+    ("earnings", "偏空"): "10_earnings_bear.png",
+    ("earnings", "中性"): "11_earnings_neutral.png",
+    ("earnings", "观望"): "12_earnings_watch.png",
+
+    ("sector", "偏多"): "13_sector_bull.png",
+    ("sector", "偏空"): "14_sector_bear.png",
+    ("sector", "中性"): "15_sector_neutral.png",
+    ("sector", "观望"): "16_sector_watch.png",
+
+    ("flow", "偏多"): "17_flow_bull.png",
+    ("flow", "偏空"): "18_flow_bear.png",
+    ("flow", "中性"): "19_flow_neutral.png",
+    ("flow", "观望"): "20_flow_watch.png",
+
+    ("tech", "偏多"): "21_tech_bull.png",
+    ("tech", "偏空"): "22_tech_bear.png",
+    ("tech", "中性"): "23_tech_neutral.png",
+    ("tech", "观望"): "24_tech_watch.png",
+
+    ("cyclical", "偏多"): "25_cyclical_bull.png",
+    ("cyclical", "偏空"): "26_cyclical_bear.png",
+    ("cyclical", "中性"): "27_cyclical_neutral.png",
+    ("cyclical", "观望"): "28_cyclical_watch.png",
+
+    ("risk", "偏多"): "29_risk_bull.png",
+    ("risk", "偏空"): "30_risk_bear.png",
+    ("risk", "中性"): "31_risk_neutral.png",
+    ("risk", "观望"): "32_risk_watch.png",
+}
+
+MARKET_FALLBACK_MAP = {
+    "美股": "41_fallback_us.png",
+    "A股": "42_fallback_cn.png",
+    "港股": "43_fallback_hk.png",
+}
 
 
-def get_image_url_from_rss(entry) -> str:
-    media_content = getattr(entry, "media_content", None)
-    if media_content and isinstance(media_content, list):
-        for item in media_content:
-            url = item.get("url")
-            if url:
-                return url
+def get_best_local_image(content_type: str, bias: str, market_tag: str) -> str:
+    # 先按主图匹配
+    filename = IMAGE_MAP.get((content_type, bias))
+    if filename:
+        path = image_path(filename)
+        if os.path.isfile(path):
+            return path
 
-    media_thumbnail = getattr(entry, "media_thumbnail", None)
-    if media_thumbnail and isinstance(media_thumbnail, list):
-        for item in media_thumbnail:
-            url = item.get("url")
-            if url:
-                return url
+    # 主图没匹配到，走市场兜底图
+    fallback = MARKET_FALLBACK_MAP.get(market_tag)
+    if fallback:
+        path = image_path(fallback)
+        if os.path.isfile(path):
+            return path
 
-    links = getattr(entry, "links", [])
-    if links:
-        for item in links:
-            href = item.get("href", "")
-            type_ = item.get("type", "")
-            rel = item.get("rel", "")
-            if href and (rel == "enclosure" or str(type_).startswith("image/")):
-                return href
+    # 最后兜底
+    neutral_path = image_path("40_fallback_neutral.png")
+    if os.path.isfile(neutral_path):
+        return neutral_path
 
-    raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-    if raw_summary:
-        m = re.search(r'<img[^>]+src="([^"]+)"', raw_summary, re.I)
-        if m:
-            return m.group(1)
-
-    return ""
-
-
-def get_image_url_from_page(article_url: str) -> str:
-    if not is_valid_http_url(article_url):
-        return ""
-
-    try:
-        resp = requests.get(article_url, headers=REQUEST_HEADERS, timeout=15)
-        if resp.status_code != 200 or not resp.text:
-            return ""
-
-        html_text = resp.text
-
-        patterns = [
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
-        ]
-
-        for pattern in patterns:
-            m = re.search(pattern, html_text, re.I)
-            if m:
-                img = normalize_image_url(m.group(1).strip(), article_url)
-                if is_valid_http_url(img):
-                    return img
-
-        imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, re.I)
-        for img in imgs:
-            img = normalize_image_url(img.strip(), article_url)
-            if not is_valid_http_url(img):
-                continue
-            lower_img = img.lower()
-            if any(x in lower_img for x in ["logo", "icon", "avatar", "sprite", ".svg"]):
-                continue
-            return img
-
-    except Exception as e:
-        print(f"网页抓图失败: {article_url} -> {e}")
+    bull_path = image_path("39_fallback_bull.png")
+    if os.path.isfile(bull_path):
+        return bull_path
 
     return ""
-
-
-def get_local_cover_list():
-    if not os.path.isdir(COVERS_DIR):
-        return []
-
-    files = []
-    for name in os.listdir(COVERS_DIR):
-        lower = name.lower()
-        if lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".png"):
-            files.append(os.path.join(COVERS_DIR, name))
-    return sorted(files)
-
-
-def get_random_local_cover():
-    covers = get_local_cover_list()
-    if not covers:
-        return ""
-    return random.choice(covers)
-
-
-def get_best_remote_image_url(entry, article_url: str) -> str:
-    rss_img = get_image_url_from_rss(entry)
-    if is_valid_http_url(rss_img):
-        return rss_img
-
-    page_img = get_image_url_from_page(article_url)
-    if is_valid_http_url(page_img):
-        return page_img
-
-    return ""
-
-
-def guess_extension_from_response(resp, url: str) -> str:
-    content_type = (resp.headers.get("Content-Type") or "").lower()
-
-    if "jpeg" in content_type or "jpg" in content_type:
-        return ".jpg"
-    if "png" in content_type:
-        return ".png"
-    if "webp" in content_type:
-        return ".webp"
-
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    if path.endswith(".jpg") or path.endswith(".jpeg"):
-        return ".jpg"
-    if path.endswith(".png"):
-        return ".png"
-    if path.endswith(".webp"):
-        return ".webp"
-
-    return ".jpg"
-
-
-def download_remote_image(url: str) -> str:
-    if not is_valid_http_url(url):
-        return ""
-
-    try:
-        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=20, stream=True)
-        if resp.status_code != 200:
-            print(f"下载图片失败，状态码: {resp.status_code} -> {url}")
-            return ""
-
-        content_type = (resp.headers.get("Content-Type") or "").lower()
-        if "image/" not in content_type and not any(x in content_type for x in ["jpeg", "jpg", "png", "webp"]):
-            print(f"下载内容不是图片: {content_type} -> {url}")
-            return ""
-
-        ext = guess_extension_from_response(resp, url)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    tmp.write(chunk)
-            return tmp.name
-
-    except Exception as e:
-        print(f"下载远程图片异常: {url} -> {e}")
-        return ""
 
 
 # =========================
@@ -355,25 +286,34 @@ def download_remote_image(url: str) -> str:
 # =========================
 
 SYSTEM_PROMPT = """
-你是“势界行情深读”的中文财经编辑。你的任务不是机械翻译，而是做中文编译 + 市场解读。
+你是“观市财经”的中文股市编辑，负责把英文财经新闻加工成适合中文频道发布的内容。
 
-写作要求：
-1. 语言自然、简洁、有判断力，不要逐句直译
-2. 不要空话，不要喊单，不要夸张
-3. 重点分析市场如何理解这条消息，而不是重复新闻本身
-4. 每条内容只从2到3个角度展开，角度可包括：情绪、资金预期、短线影响、后续观察、风险、供需、交易逻辑
-5. 不要加入原文没有的信息
-6. 不要输出英文
-7. 不要反复使用这些句式：
-   - 这条消息的核心在于……
-   - 真正需要观察的是……
-   - 市场会把……视为……
-   - 短线更容易……
-   - 本质上会先被交易层面当作……
-8. 每次尽量更换开头表达方式
-9. 不要使用“...”或“……”或任何省略式表达
-10. 句子必须完整，宁可更短也不要半句话
-11. 【势界行情深读】部分总字数尽量控制在70到110字
+覆盖市场：
+A股、港股、美股
+
+你的任务不是机械翻译，而是做中文编译和市场提炼。
+
+要求：
+1. 不要逐句直译，不要翻译腔
+2. 不要输出英文
+3. 不要输出原新闻标题、原新闻摘要、来源、链接
+4. main_text 要写成适合频道发布的“观市财经”正文，2到4句
+5. takeaway 要写成“观市看点”，只写1句
+6. 同时判断 market_tag、content_type、bias
+7. 语言自然、简洁、专业，不要喊单，不要夸张
+8. 不要保留原新闻痕迹，要像重新加工后的中文内容
+9. main_text 不要写成模板化套话，不要总是同一种开头
+10. takeaway 要简短、有判断，不要重复正文
+11. 只输出 JSON，不要输出 JSON 以外的任何内容
+
+market_tag 只能是：
+A股、港股、美股
+
+content_type 只能是：
+market、macro、earnings、sector、flow、tech、cyclical、risk
+
+bias 只能是：
+偏多、偏空、中性、观望
 """.strip()
 
 
@@ -383,19 +323,25 @@ def build_user_prompt(title_en: str, summary_en: str) -> str:
 
 JSON 格式必须严格如下：
 {{
-  "news": "一句中文新闻",
-  "insight": "2到3句中文分析",
-  "bias": "偏多/偏空/中性/观望"
+  "market_tag": "A股/港股/美股",
+  "content_type": "market/macro/earnings/sector/flow/tech/cyclical/risk",
+  "bias": "偏多/偏空/中性/观望",
+  "main_text": "2到4句加工后的中文正文",
+  "takeaway": "1句简短的观市看点"
 }}
 
-要求：
-1. news 只写一句，简洁完整
-2. insight 写2到3句，避免模板化表达，不要总是同一种起手句
-3. bias 只能是：偏多、偏空、中性、观望 四选一
-4. 不要输出英文
-5. 不要输出来源、链接、标题说明、额外字段
-6. 不要出现省略号
-7. 句子必须完整
+字段要求：
+1. market_tag 只能是：A股、港股、美股
+2. content_type 只能是：market、macro、earnings、sector、flow、tech、cyclical、risk
+3. bias 只能是：偏多、偏空、中性、观望
+4. main_text 写成“观市财经”风格，2到4句，不要翻译腔，不要来源痕迹
+5. takeaway 写成“观市看点”风格，只写1句，简短有判断
+6. 不要输出英文
+7. 不要输出来源
+8. 不要输出链接
+9. 不要输出多余字段
+10. 不要使用省略号
+11. 句子必须完整
 
 英文标题：
 {title_en}
@@ -412,44 +358,7 @@ def extract_json_object(text: str) -> str:
     return m.group(0).strip() if m else ""
 
 
-def normalize_ai_result(raw_text: str) -> str:
-    """
-    强制重组为固定格式：
-    【新闻】
-    ...
-    
-    【势界行情深读】
-    ...
-    
-    【市场倾向】 偏多
-    """
-    import json
-
-    raw_json = extract_json_object(raw_text)
-    if not raw_json:
-        return ""
-
-    try:
-        data = json.loads(raw_json)
-    except Exception:
-        return ""
-
-    news = clean_line(str(data.get("news", "")))
-    insight = clean_paragraph(str(data.get("insight", "")))
-    bias = clean_line(str(data.get("bias", "")))
-
-    allowed = {"偏多", "偏空", "中性", "观望"}
-    if bias not in allowed:
-        return ""
-
-    if not news or not insight:
-        return ""
-
-    final_text = f"【新闻】\n{news}\n\n【势界行情深读】\n{insight}\n\n【市场倾向】 {bias}"
-    return final_text.strip()
-
-
-def ai_compile_news(title_en: str, summary_en: str) -> str:
+def ai_compile_news(title_en: str, summary_en: str) -> dict:
     prompt = build_user_prompt(title_en, summary_en)
 
     response = client.responses.create(
@@ -458,14 +367,71 @@ def ai_compile_news(title_en: str, summary_en: str) -> str:
         input=prompt,
     )
     raw_text = (response.output_text or "").strip()
-    return normalize_ai_result(raw_text)
+    raw_json = extract_json_object(raw_text)
+    if not raw_json:
+        return {}
+
+    try:
+        data = json.loads(raw_json)
+    except Exception:
+        return {}
+
+    market_tag = clean_one_line(str(data.get("market_tag", "")))
+    content_type = clean_one_line(str(data.get("content_type", "")))
+    bias = clean_one_line(str(data.get("bias", "")))
+    main_text = clean_paragraph(str(data.get("main_text", "")))
+    takeaway = clean_one_line(str(data.get("takeaway", "")))
+
+    valid_market = {"A股", "港股", "美股"}
+    valid_type = {"market", "macro", "earnings", "sector", "flow", "tech", "cyclical", "risk"}
+    valid_bias = {"偏多", "偏空", "中性", "观望"}
+
+    if market_tag not in valid_market:
+        return {}
+    if content_type not in valid_type:
+        return {}
+    if bias not in valid_bias:
+        return {}
+    if not main_text or not takeaway:
+        return {}
+
+    return {
+        "market_tag": market_tag,
+        "content_type": content_type,
+        "bias": bias,
+        "main_text": main_text,
+        "takeaway": takeaway,
+    }
 
 
-def is_valid_ai_output(text: str) -> bool:
-    if not text:
-        return False
-    required = ["【新闻】\n", "\n【势界行情深读】\n", "\n【市场倾向】 "]
-    return all(x in text for x in required)
+# =========================
+# 标签映射
+# =========================
+
+TYPE_TAG_MAP = {
+    "market": "#大盘",
+    "macro": "#宏观",
+    "earnings": "#财报",
+    "sector": "#板块",
+    "flow": "#资金",
+    "tech": "#科技",
+    "cyclical": "#周期",
+    "risk": "#风险",
+}
+
+
+def build_final_text(result: dict) -> str:
+    market_tag = "#" + result["market_tag"]
+    type_tag = TYPE_TAG_MAP[result["content_type"]]
+    bias_tag = "#" + result["bias"]
+
+    return f"""【观市财经】
+{result["main_text"]}
+
+【观市看点】
+{result["takeaway"]}
+
+{market_tag} {type_tag} {bias_tag}""".strip()
 
 
 # =========================
@@ -527,6 +493,10 @@ def process_feed(feed_url: str):
         if not link or not title_en:
             continue
 
+        if should_skip_title(title_en):
+            print("跳过低价值标题:", title_en)
+            continue
+
         if has_sent(link):
             continue
 
@@ -536,36 +506,28 @@ def process_feed(feed_url: str):
             continue
 
         summary_en = extract_summary(entry)
-        temp_remote_file = ""
 
         try:
-            final_text = ai_compile_news(title_en, summary_en)
-
-            if not is_valid_ai_output(final_text):
-                print("AI 输出格式不合格，跳过:", title_en)
+            result = ai_compile_news(title_en, summary_en)
+            if not result:
+                print("AI 结果无效，跳过:", title_en)
                 mark_sent(link)
                 continue
 
-            resp = None
+            final_text = build_final_text(result)
+            photo_path = get_best_local_image(
+                result["content_type"],
+                result["bias"],
+                result["market_tag"]
+            )
 
-            remote_img_url = get_best_remote_image_url(entry, link)
-            if remote_img_url:
-                temp_remote_file = download_remote_image(remote_img_url)
-
-            if temp_remote_file and os.path.isfile(temp_remote_file):
-                resp = send_telegram_photo_by_file(temp_remote_file, final_text)
+            if photo_path and os.path.isfile(photo_path):
+                resp = send_telegram_photo_by_file(photo_path, final_text)
                 if resp.status_code != 200:
-                    print("远程图上传失败，尝试公图")
-
-            if resp is None or resp.status_code != 200:
-                local_cover = get_random_local_cover()
-                if local_cover and os.path.isfile(local_cover):
-                    resp = send_telegram_photo_by_file(local_cover, final_text)
-                    if resp.status_code != 200:
-                        print("公图发送失败，改为纯文字")
-                        resp = send_telegram_message(final_text)
-                else:
+                    print("图片发送失败，改为纯文字")
                     resp = send_telegram_message(final_text)
+            else:
+                resp = send_telegram_message(final_text)
 
             if resp.status_code == 200:
                 mark_sent(link)
@@ -575,13 +537,6 @@ def process_feed(feed_url: str):
 
         except Exception as e:
             print("处理失败:", title_en, "->", e)
-
-        finally:
-            if temp_remote_file and os.path.isfile(temp_remote_file):
-                try:
-                    os.remove(temp_remote_file)
-                except Exception:
-                    pass
 
         time.sleep(SEND_DELAY)
 
@@ -596,7 +551,7 @@ def main():
 
     init_db()
 
-    print("势界行情深读机器人启动成功")
+    print("观市财经频道机器人启动成功")
     print("频道:", CHAT_ID)
 
     while True:
